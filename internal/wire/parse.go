@@ -934,11 +934,10 @@ func (oc *objectCache) processSlice(info *types.Info, pkgPath string, call *ast.
 				errors.New("wire.Slice element provider must have a return type"))}
 		}
 		if transform != nil {
-			// With transform: element output must be assignable to transform's input
-			if !types.AssignableTo(p.Out[0], transform.Args[0].Type) {
-				return nil, []error{notePosition(oc.fset.Position(call.Args[i].Pos()),
-					fmt.Errorf("wire.Slice element provider returns %s, which is not assignable to transform input type %s", p.Out[0], transform.Args[0].Type))}
-			}
+			// With transform: skip assignability check here.
+			// The transform may be a generic function (e.g., event.WrapHandler[T])
+			// whose type parameters aren't resolved until Go compiles the generated code.
+			// Go's type inference at the call site will validate correctness.
 		} else {
 			// Without transform: element output must be assignable to slice element type
 			if !types.AssignableTo(p.Out[0], elemType) {
