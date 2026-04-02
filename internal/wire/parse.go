@@ -252,10 +252,11 @@ type Field struct {
 // SliceProvider represents a wire.Slice() call that collects
 // multiple provider outputs into a slice.
 type SliceProvider struct {
-	Pos      token.Pos
-	Out      types.Type   // The slice type (e.g., []Foo or EventHandlers)
-	ElemType types.Type   // The element type (e.g., Foo or *event.AsynqHandler)
-	Elements []*Provider  // Element providers, each producing ElemType
+	Pos       token.Pos
+	Out       types.Type   // The slice type (e.g., []Foo or EventHandlers)
+	ElemType  types.Type   // The element type (e.g., Foo or *event.AsynqHandler)
+	Elements  []*Provider  // Element providers, each producing a type consumed by Transform or directly assignable to ElemType
+	Transform *Provider    // Optional transform function applied to each element's output before collecting
 }
 
 // Load finds all the provider sets in the packages that match the given
@@ -893,9 +894,31 @@ func (oc *objectCache) processSlice(info *types.Info, pkgPath string, call *ast.
 			fmt.Errorf("first argument to Slice must be a pointer to a slice type, got %s", sliceType))}
 	}
 
+	// Check if second arg is a transform function (not a new() call).
+	// wire.Slice(new([]T), transformFn, provider1, provider2, ...)
+	var transform *Provider
+	elemStartIdx := 1
+
+	// Try to parse the second arg: if it's a provider whose output is assignable
+	// to elemType and whose single input is NOT elemType, treat it as a transform.
+	if len(call.Args) >= 3 {
+		item, errs := oc.processExpr(info, pkgPath, call.Args[1], "")
+		if len(errs) == 0 {
+			if p, ok := item.(*Provider); ok && len(p.Out) > 0 && len(p.Args) == 1 {
+				// If this provider's output is assignable to elemType
+				// and it takes a single argument that's NOT the elemType,
+				// treat it as a transform function.
+				if types.AssignableTo(p.Out[0], elemType) && !types.AssignableTo(p.Args[0].Type, elemType) {
+					transform = p
+					elemStartIdx = 2
+				}
+			}
+		}
+	}
+
 	// Process remaining args as element providers
 	var elements []*Provider
-	for i := 1; i < len(call.Args); i++ {
+	for i := elemStartIdx; i < len(call.Args); i++ {
 		item, errs := oc.processExpr(info, pkgPath, call.Args[i], "")
 		if len(errs) > 0 {
 			return nil, errs
@@ -905,23 +928,33 @@ func (oc *objectCache) processSlice(info *types.Info, pkgPath string, call *ast.
 			return nil, []error{notePosition(oc.fset.Position(call.Args[i].Pos()),
 				errors.New("wire.Slice element must be a provider function"))}
 		}
-		// Validate return type is assignable to element type
+		// Validate return type
 		if len(p.Out) == 0 {
 			return nil, []error{notePosition(oc.fset.Position(call.Args[i].Pos()),
 				errors.New("wire.Slice element provider must have a return type"))}
 		}
-		if !types.AssignableTo(p.Out[0], elemType) {
-			return nil, []error{notePosition(oc.fset.Position(call.Args[i].Pos()),
-				fmt.Errorf("wire.Slice element provider returns %s, which is not assignable to slice element type %s", p.Out[0], elemType))}
+		if transform != nil {
+			// With transform: element output must be assignable to transform's input
+			if !types.AssignableTo(p.Out[0], transform.Args[0].Type) {
+				return nil, []error{notePosition(oc.fset.Position(call.Args[i].Pos()),
+					fmt.Errorf("wire.Slice element provider returns %s, which is not assignable to transform input type %s", p.Out[0], transform.Args[0].Type))}
+			}
+		} else {
+			// Without transform: element output must be assignable to slice element type
+			if !types.AssignableTo(p.Out[0], elemType) {
+				return nil, []error{notePosition(oc.fset.Position(call.Args[i].Pos()),
+					fmt.Errorf("wire.Slice element provider returns %s, which is not assignable to slice element type %s", p.Out[0], elemType))}
+			}
 		}
 		elements = append(elements, p)
 	}
 
 	return &SliceProvider{
-		Pos:      call.Pos(),
-		Out:      sliceType,
-		ElemType: elemType,
-		Elements: elements,
+		Pos:       call.Pos(),
+		Out:       sliceType,
+		ElemType:  elemType,
+		Elements:  elements,
+		Transform: transform,
 	}, nil
 }
 

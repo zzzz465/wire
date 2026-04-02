@@ -274,7 +274,7 @@ dfs:
 			}
 
 			// All dependencies resolved. Emit a funcProviderCall for each element,
-			// then a sliceAssembly call.
+			// optionally a transform call, then a sliceAssembly call.
 			var elemCallIndices []int
 			for _, elemProv := range sp.Elements {
 				args := make([]int, len(elemProv.Args))
@@ -289,7 +289,6 @@ dfs:
 					args[j] = v.(int)
 				}
 				elemIdx := given.Len() + len(calls)
-				elemCallIndices = append(elemCallIndices, elemIdx)
 				c := call{
 					kind:           funcProviderCall,
 					pkg:            elemProv.Pkg,
@@ -303,6 +302,26 @@ dfs:
 					hasErr:         elemProv.HasErr,
 				}
 				calls = append(calls, c)
+
+				// If transform function exists, emit a call wrapping the element
+				if sp.Transform != nil {
+					transformIdx := given.Len() + len(calls)
+					tc := call{
+						kind:           funcProviderCall,
+						pkg:            sp.Transform.Pkg,
+						name:           sp.Transform.Name,
+						methodExprRecv: sp.Transform.MethodExprRecv,
+						args:           []int{elemIdx},
+						ins:            []types.Type{elemProv.Out[0]},
+						out:            sp.Transform.Out[0],
+						hasCleanup:     sp.Transform.HasCleanup,
+						hasErr:         sp.Transform.HasErr,
+					}
+					calls = append(calls, tc)
+					elemCallIndices = append(elemCallIndices, transformIdx)
+				} else {
+					elemCallIndices = append(elemCallIndices, elemIdx)
+				}
 			}
 			index.Set(curr.t, given.Len()+len(calls))
 			calls = append(calls, call{
