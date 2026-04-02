@@ -742,6 +742,24 @@ func (oc *objectCache) processExpr(info *types.Info, pkgPath string, expr ast.Ex
 			return p, notePositionAll(exprPos, errs)
 		}
 	}
+	// Handle generic function instantiation: event.WrapHandler[T]
+	// ast.IndexExpr represents pkg.Func[TypeArg] in Go 1.18+
+	if idx, ok := expr.(*ast.IndexExpr); ok {
+		typ := info.TypeOf(idx)
+		if sig, ok := typ.(*types.Signature); ok {
+			// Extract the function object from the base expression
+			obj := qualifiedIdentObject(info, idx.X)
+			if obj == nil {
+				return nil, []error{notePosition(exprPos, errors.New("cannot resolve generic function instantiation"))}
+			}
+			fn, ok := obj.(*types.Func)
+			if !ok {
+				return nil, []error{notePosition(exprPos, fmt.Errorf("generic instantiation of non-function %s", obj.Name()))}
+			}
+			p, errs := processProviderSignature(oc.fset, fn.Pkg(), fn.Name(), nil, fn.Pos(), sig)
+			return p, notePositionAll(exprPos, errs)
+		}
+	}
 	if obj := qualifiedIdentObject(info, expr); obj != nil {
 		item, errs := oc.get(obj)
 		return item, mapErrors(errs, func(err error) error {
@@ -900,15 +918,16 @@ func (oc *objectCache) processSlice(info *types.Info, pkgPath string, call *ast.
 	elemStartIdx := 1
 
 	// Try to parse the second arg: if it's a provider whose output is assignable
-	// to elemType and whose single input is NOT elemType, treat it as a transform.
+	// to elemType and whose single CONCRETE input is NOT elemType, treat it as a transform.
+	// Skip detection if the input is an interface (likely a generic instantiation, not a transform).
 	if len(call.Args) >= 3 {
 		item, errs := oc.processExpr(info, pkgPath, call.Args[1], "")
 		if len(errs) == 0 {
 			if p, ok := item.(*Provider); ok && len(p.Out) > 0 && len(p.Args) == 1 {
-				// If this provider's output is assignable to elemType
-				// and it takes a single argument that's NOT the elemType,
-				// treat it as a transform function.
-				if types.AssignableTo(p.Out[0], elemType) && !types.AssignableTo(p.Args[0].Type, elemType) {
+				_, inputIsInterface := p.Args[0].Type.Underlying().(*types.Interface)
+				if !inputIsInterface &&
+					types.AssignableTo(p.Out[0], elemType) &&
+					!types.AssignableTo(p.Args[0].Type, elemType) {
 					transform = p
 					elemStartIdx = 2
 				}

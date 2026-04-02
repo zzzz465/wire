@@ -255,17 +255,64 @@ dfs:
 			})
 		case pv.IsSlice():
 			sp := pv.Slice()
+
+			// sliceFindConcreteType resolves a type for Slice element dependencies.
+			// For interface types, it searches the provider map for a concrete type
+			// that implements the interface (needed for generic function instantiation).
+			sliceFindConcreteType := func(argType types.Type) types.Type {
+				// Exact match in provider map
+				if set.providerMap.At(argType) != nil {
+					return argType
+				}
+				// Assignable match: find a concrete type in provider map that satisfies the interface
+				if iface, ok := argType.Underlying().(*types.Interface); ok {
+					var found types.Type
+					set.providerMap.Iterate(func(k types.Type, _ interface{}) {
+						if found != nil {
+							return
+						}
+						if types.Implements(k, iface) || types.Implements(types.NewPointer(k), iface) {
+							found = k
+						}
+					})
+					return found
+				}
+				return nil
+			}
+
+			// sliceResolveArg finds the index of a resolved value for the given type.
+			sliceResolveArg := func(argType types.Type) (int, bool) {
+				concreteType := sliceFindConcreteType(argType)
+				if concreteType == nil {
+					return -1, false
+				}
+				v := index.At(concreteType)
+				if v == nil {
+					return -1, false
+				}
+				if v == errAbort {
+					return -1, false
+				}
+				return v.(int), true
+			}
+
 			// Ensure all element providers' dependencies have been visited.
 			allVisited := true
 			for _, elemProv := range sp.Elements {
 				for i := len(elemProv.Args) - 1; i >= 0; i-- {
 					a := elemProv.Args[i]
-					if index.At(a.Type) == nil {
+					if _, ok := sliceResolveArg(a.Type); !ok {
+						// Push the CONCRETE type, not the interface type
+						concreteType := sliceFindConcreteType(a.Type)
+						pushType := a.Type
+						if concreteType != nil {
+							pushType = concreteType
+						}
 						if allVisited {
 							stk = append(stk, curr)
 							allVisited = false
 						}
-						stk = append(stk, frame{t: a.Type, from: curr.t, up: &curr})
+						stk = append(stk, frame{t: pushType, from: curr.t, up: &curr})
 					}
 				}
 			}
@@ -281,12 +328,12 @@ dfs:
 				ins := make([]types.Type, len(elemProv.Args))
 				for j, a := range elemProv.Args {
 					ins[j] = a.Type
-					v := index.At(a.Type)
-					if v == errAbort {
+					idx, ok := sliceResolveArg(a.Type)
+					if !ok {
 						index.Set(curr.t, errAbort)
 						continue dfs
 					}
-					args[j] = v.(int)
+					args[j] = idx
 				}
 				elemIdx := given.Len() + len(calls)
 				c := call{
