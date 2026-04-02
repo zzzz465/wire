@@ -33,6 +33,7 @@ const (
 	structProvider
 	valueExpr
 	selectorExpr
+	sliceAssembly
 )
 
 // A call represents a step of an injector function.  It may be either a
@@ -92,6 +93,10 @@ type call struct {
 	// The following are only set for kind == selectorExpr:
 
 	ptrToField bool
+
+	// The following are only set for kind == sliceAssembly:
+
+	sliceElemType types.Type
 }
 
 // solve finds the sequence of calls required to produce an output type
@@ -248,6 +253,64 @@ dfs:
 				args:       args,
 				ptrToField: ptrToField,
 			})
+		case pv.IsSlice():
+			sp := pv.Slice()
+			// Ensure all element providers' dependencies have been visited.
+			allVisited := true
+			for _, elemProv := range sp.Elements {
+				for i := len(elemProv.Args) - 1; i >= 0; i-- {
+					a := elemProv.Args[i]
+					if index.At(a.Type) == nil {
+						if allVisited {
+							stk = append(stk, curr)
+							allVisited = false
+						}
+						stk = append(stk, frame{t: a.Type, from: curr.t, up: &curr})
+					}
+				}
+			}
+			if !allVisited {
+				continue
+			}
+
+			// All dependencies resolved. Emit a funcProviderCall for each element,
+			// then a sliceAssembly call.
+			var elemCallIndices []int
+			for _, elemProv := range sp.Elements {
+				args := make([]int, len(elemProv.Args))
+				ins := make([]types.Type, len(elemProv.Args))
+				for j, a := range elemProv.Args {
+					ins[j] = a.Type
+					v := index.At(a.Type)
+					if v == errAbort {
+						index.Set(curr.t, errAbort)
+						continue dfs
+					}
+					args[j] = v.(int)
+				}
+				elemIdx := given.Len() + len(calls)
+				elemCallIndices = append(elemCallIndices, elemIdx)
+				c := call{
+					kind:           funcProviderCall,
+					pkg:            elemProv.Pkg,
+					name:           elemProv.Name,
+					methodExprRecv: elemProv.MethodExprRecv,
+					args:           args,
+					varargs:        elemProv.Varargs,
+					ins:            ins,
+					out:            elemProv.Out[0],
+					hasCleanup:     elemProv.HasCleanup,
+					hasErr:         elemProv.HasErr,
+				}
+				calls = append(calls, c)
+			}
+			index.Set(curr.t, given.Len()+len(calls))
+			calls = append(calls, call{
+				kind:          sliceAssembly,
+				out:           curr.t,
+				sliceElemType: sp.ElemType,
+				args:          elemCallIndices,
+			})
 		default:
 			panic("unknown return value from ProviderSet.For")
 		}
@@ -328,6 +391,18 @@ func verifyArgsUsed(set *ProviderSet, used []*providerSetSrc) []error {
 			errs = append(errs, fmt.Errorf("unused field %q.%s", f.Parent, f.Name))
 		}
 	}
+	for _, s := range set.Slices {
+		found := false
+		for _, u := range used {
+			if u.Slice == s {
+				found = true
+				break
+			}
+		}
+		if !found {
+			errs = append(errs, fmt.Errorf("unused slice provider for %s", types.TypeString(s.Out, nil)))
+		}
+	}
 	return errs
 }
 
@@ -404,6 +479,15 @@ func buildProviderMap(fset *token.FileSet, hasher typeutil.Hasher, set *Provider
 			srcMap.Set(typ, src)
 		}
 	}
+	for _, s := range set.Slices {
+		src := &providerSetSrc{Slice: s}
+		if prevSrc := srcMap.At(s.Out); prevSrc != nil {
+			ec.add(bindingConflictError(fset, s.Out, set, src, prevSrc.(*providerSetSrc)))
+			continue
+		}
+		providerMap.Set(s.Out, &ProvidedType{t: s.Out, s: s})
+		srcMap.Set(s.Out, src)
+	}
 	if len(ec.errors) > 0 {
 		return nil, nil, ec.errors
 	}
@@ -468,6 +552,36 @@ func verifyAcyclic(providerMap *typeutil.Map, hasher typeutil.Hasher) []error {
 				// Leaf: values do not have dependencies.
 			case pt.IsArg():
 				// Injector arguments do not have dependencies.
+			case pt.IsSlice():
+				// Slice element providers' dependencies come from the main graph.
+				// Collect all element provider args for cycle checking.
+				sp := pt.Slice()
+				var args []types.Type
+				for _, elemProv := range sp.Elements {
+					for _, a := range elemProv.Args {
+						args = append(args, a.Type)
+					}
+				}
+				for _, a := range args {
+					hasCycle := false
+					for i, b := range curr {
+						if types.Identical(a, b) {
+							sb := new(strings.Builder)
+							fmt.Fprintf(sb, "cycle for %s:\n", types.TypeString(a, nil))
+							for j := i; j < len(curr); j++ {
+								fmt.Fprintf(sb, "%s ->\n", types.TypeString(curr[j], nil))
+							}
+							fmt.Fprintf(sb, "%s", types.TypeString(a, nil))
+							ec.add(errors.New(sb.String()))
+							hasCycle = true
+							break
+						}
+					}
+					if !hasCycle {
+						next := append(append([]types.Type(nil), curr...), a)
+						stk = append(stk, next)
+					}
+				}
 			case pt.IsProvider() || pt.IsField():
 				var args []types.Type
 				if pt.IsProvider() {

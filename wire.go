@@ -169,6 +169,31 @@ func Struct(structType interface{}, fieldNames ...string) StructProvider {
 // StructFields is a collection of the fields from a struct.
 type StructFields struct{}
 
+// A SliceCollector is a marker type for collecting providers into a slice.
+type SliceCollector struct{}
+
+// Slice declares that the outputs of the given providers will be collected into
+// a slice. The first argument must be a pointer to a slice type (e.g., new([]Foo)).
+// The remaining arguments are provider functions whose outputs are assignable to
+// the slice's element type. Each provider function is resolved through the
+// normal dependency injection mechanism (its parameters come from the provider set),
+// but its output is not registered individually — it is only used as an element
+// of the resulting slice.
+//
+// Example:
+//
+//	type EventHandlers []*event.AsynqHandler
+//
+//	var Set = wire.NewSet(
+//	    wire.Slice(new(EventHandlers),
+//	        NewFooHandler,  // func(...) *event.AsynqHandler
+//	        NewBarHandler,  // func(...) *event.AsynqHandler
+//	    ),
+//	)
+func Slice(sliceType interface{}, elements ...interface{}) SliceCollector {
+	return SliceCollector{}
+}
+
 // FieldsOf declares that the fields named of the given struct type will be used
 // to provide the types of those fields. The structType argument must be a
 // pointer to the struct or a pointer to a pointer to the struct it wishes to reference.

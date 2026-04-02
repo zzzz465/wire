@@ -44,6 +44,7 @@ type providerSetSrc struct {
 	Import      *ProviderSet
 	InjectorArg *InjectorArg
 	Field       *Field
+	Slice       *SliceProvider
 }
 
 // description returns a string describing the source of p, including line numbers.
@@ -72,6 +73,8 @@ func (p *providerSetSrc) description(fset *token.FileSet, typ types.Type) string
 		return fmt.Sprintf("argument %s to injector function %s (%s)", args.Tuple.At(p.InjectorArg.Index).Name(), args.Name, fset.Position(args.Pos))
 	case p.Field != nil:
 		return fmt.Sprintf("wire.FieldsOf (%s)", fset.Position(p.Field.Pos))
+	case p.Slice != nil:
+		return fmt.Sprintf("wire.Slice (%s)", fset.Position(p.Slice.Pos))
 	}
 	panic("providerSetSrc with no fields set")
 }
@@ -106,6 +109,7 @@ type ProviderSet struct {
 	Bindings  []*IfaceBinding
 	Values    []*Value
 	Fields    []*Field
+	Slices    []*SliceProvider
 	Imports   []*ProviderSet
 	// InjectorArgs is only filled in for wire.Build.
 	InjectorArgs *InjectorArgs
@@ -243,6 +247,15 @@ type Field struct {
 	// field type. If the field is coming from a pointer to a struct,
 	// there will be a second element providing a pointer to the field.
 	Out []types.Type
+}
+
+// SliceProvider represents a wire.Slice() call that collects
+// multiple provider outputs into a slice.
+type SliceProvider struct {
+	Pos      token.Pos
+	Out      types.Type   // The slice type (e.g., []Foo or EventHandlers)
+	ElemType types.Type   // The element type (e.g., Foo or *event.AsynqHandler)
+	Elements []*Provider  // Element providers, each producing ElemType
 }
 
 // Load finds all the provider sets in the packages that match the given
@@ -780,6 +793,12 @@ func (oc *objectCache) processExpr(info *types.Info, pkgPath string, expr ast.Ex
 				return nil, []error{notePosition(exprPos, err)}
 			}
 			return v, nil
+		case "Slice":
+			s, errs := oc.processSlice(info, pkgPath, call)
+			if len(errs) > 0 {
+				return nil, notePositionAll(exprPos, errs)
+			}
+			return s, nil
 		default:
 			return nil, []error{notePosition(exprPos, errors.New("unknown pattern"))}
 		}
@@ -821,6 +840,8 @@ func (oc *objectCache) processNewSet(info *types.Info, pkgPath string, call *ast
 			pset.Values = append(pset.Values, item)
 		case []*Field:
 			pset.Fields = append(pset.Fields, item...)
+		case *SliceProvider:
+			pset.Slices = append(pset.Slices, item)
 		default:
 			panic("unknown item type")
 		}
@@ -844,6 +865,64 @@ func (oc *objectCache) finalizeProviderSet(pset *ProviderSet) []error {
 		return errs
 	}
 	return nil
+}
+
+// processSlice processes a wire.Slice(...) call expression.
+func (oc *objectCache) processSlice(info *types.Info, pkgPath string, call *ast.CallExpr) (*SliceProvider, []error) {
+	if len(call.Args) < 2 {
+		return nil, []error{notePosition(oc.fset.Position(call.Pos()),
+			errors.New("call to Slice requires at least two arguments: slice type and element providers"))}
+	}
+
+	// First arg must be new([]T) or new(SliceAlias)
+	sliceArgType := info.TypeOf(call.Args[0])
+	slicePtr, ok := sliceArgType.(*types.Pointer)
+	if !ok {
+		return nil, []error{notePosition(oc.fset.Position(call.Args[0].Pos()),
+			errors.New("first argument to Slice must be a pointer to a slice type (e.g., new([]Foo))"))}
+	}
+	sliceType := slicePtr.Elem()
+
+	// Get element type from slice
+	var elemType types.Type
+	switch underlying := sliceType.Underlying().(type) {
+	case *types.Slice:
+		elemType = underlying.Elem()
+	default:
+		return nil, []error{notePosition(oc.fset.Position(call.Args[0].Pos()),
+			fmt.Errorf("first argument to Slice must be a pointer to a slice type, got %s", sliceType))}
+	}
+
+	// Process remaining args as element providers
+	var elements []*Provider
+	for i := 1; i < len(call.Args); i++ {
+		item, errs := oc.processExpr(info, pkgPath, call.Args[i], "")
+		if len(errs) > 0 {
+			return nil, errs
+		}
+		p, ok := item.(*Provider)
+		if !ok {
+			return nil, []error{notePosition(oc.fset.Position(call.Args[i].Pos()),
+				errors.New("wire.Slice element must be a provider function"))}
+		}
+		// Validate return type is assignable to element type
+		if len(p.Out) == 0 {
+			return nil, []error{notePosition(oc.fset.Position(call.Args[i].Pos()),
+				errors.New("wire.Slice element provider must have a return type"))}
+		}
+		if !types.AssignableTo(p.Out[0], elemType) {
+			return nil, []error{notePosition(oc.fset.Position(call.Args[i].Pos()),
+				fmt.Errorf("wire.Slice element provider returns %s, which is not assignable to slice element type %s", p.Out[0], elemType))}
+		}
+		elements = append(elements, p)
+	}
+
+	return &SliceProvider{
+		Pos:      call.Pos(),
+		Out:      sliceType,
+		ElemType: elemType,
+		Elements: elements,
+	}, nil
 }
 
 // structArgType attempts to interpret an expression as a simple struct type.
@@ -1347,11 +1426,12 @@ type ProvidedType struct {
 	v *Value
 	a *InjectorArg
 	f *Field
+	s *SliceProvider
 }
 
 // IsNil reports whether pt is the zero value.
 func (pt ProvidedType) IsNil() bool {
-	return pt.p == nil && pt.v == nil && pt.a == nil && pt.f == nil
+	return pt.p == nil && pt.v == nil && pt.a == nil && pt.f == nil && pt.s == nil
 }
 
 // Type returns the output type.
@@ -1419,6 +1499,20 @@ func (pt ProvidedType) Field() *Field {
 		panic("ProvidedType does not hold a Field")
 	}
 	return pt.f
+}
+
+// IsSlice reports whether pt points to a SliceProvider.
+func (pt ProvidedType) IsSlice() bool {
+	return pt.s != nil
+}
+
+// Slice returns pt as a SliceProvider pointer. It panics if pt does not point
+// to a SliceProvider.
+func (pt ProvidedType) Slice() *SliceProvider {
+	if pt.s == nil {
+		panic("ProvidedType does not hold a SliceProvider")
+	}
+	return pt.s
 }
 
 // bindShouldUsePointer loads the wire package the user is importing from their

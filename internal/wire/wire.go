@@ -686,6 +686,8 @@ func injectPass(name string, sig *types.Signature, calls []call, set *ProviderSe
 			ig.valueExpr(lname, c)
 		case selectorExpr:
 			ig.fieldExpr(lname, c)
+		case sliceAssembly:
+			ig.sliceAssemblyExpr(lname, c)
 		default:
 			panic("unknown kind")
 		}
@@ -795,6 +797,22 @@ func (ig *injectorGen) fieldExpr(lname string, c *call) {
 	} else {
 		ig.p("%s.%s\n", ig.localNames[a-len(ig.paramNames)], c.name)
 	}
+}
+
+func (ig *injectorGen) sliceAssemblyExpr(lname string, c *call) {
+	outTypeString := types.TypeString(c.out, ig.g.qualifyPkg)
+	ig.p("\t%s := %s{", lname, outTypeString)
+	for i, a := range c.args {
+		if i > 0 {
+			ig.p(", ")
+		}
+		if a < len(ig.paramNames) {
+			ig.p("%s", ig.paramNames[a])
+		} else {
+			ig.p("%s", ig.localNames[a-len(ig.paramNames)])
+		}
+	}
+	ig.p("}\n")
 }
 
 // nameInInjector reports whether name collides with any other identifier
